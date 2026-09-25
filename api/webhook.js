@@ -130,7 +130,13 @@ async function handleNote(chatId, incomingMessageId, note) {
 
   if (!passesScore(score)) {
     await saveNote({ chatId, telegramMessageId: incomingMessageId, text: note, score, scoreReason: reason });
-    await sendTelegramMessage(chatId, `No draft made (score ${score}/10): ${reason}`);
+    await sendTelegramMessage(
+      chatId,
+      `No draft made (score ${score}/10): ${reason}\n\n` +
+        'A topic name alone won\'t score. Include at least one of: a specific ' +
+        'number or data point, a real story or example, a decision you made ' +
+        'and why, or your own opinion/take on something.'
+    );
     return;
   }
 
