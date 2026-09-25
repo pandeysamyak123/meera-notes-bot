@@ -1,5 +1,71 @@
 import { generateDraft } from '../lib/gemini.js';
+import { scoreNote, passesScore } from '../lib/scoring.js';
+import { extractSearchQuery, fetchTopNews } from '../lib/news.js';
 import { sendTelegramMessage, sendTypingAction } from '../lib/telegram.js';
+import {
+  saveNote,
+  saveDraft,
+  findPendingDraft,
+  updateDraftStatus,
+} from '../lib/supabase.js';
+
+async function handleApproval(chatId, replyToMessageId, decision) {
+  const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
+
+  if (!draft) {
+    await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
+    return;
+  }
+  if (draft.status !== 'pending') {
+    await sendTelegramMessage(chatId, `That draft was already marked ${draft.status}.`);
+    return;
+  }
+
+  await updateDraftStatus(draft.id, decision);
+  await sendTelegramMessage(
+    chatId,
+    decision === 'approved' ? 'Marked as approved.' : 'Marked as rejected - noted for later.'
+  );
+}
+
+async function handleNote(chatId, incomingMessageId, note) {
+  await sendTypingAction(chatId);
+
+  const { score, reason } = await scoreNote(note);
+
+  if (!passesScore(score)) {
+    await saveNote({ chatId, telegramMessageId: incomingMessageId, text: note, score, scoreReason: reason });
+    await sendTelegramMessage(chatId, `No draft made (score ${score}/10): ${reason}`);
+    return;
+  }
+
+  let newsItem = null;
+  try {
+    const query = await extractSearchQuery(note);
+    newsItem = await fetchTopNews(query);
+  } catch (err) {
+    console.error('News lookup failed, continuing without it:', err);
+  }
+
+  const { draft, usedNews } = await generateDraft(note, newsItem);
+
+  const noteId = await saveNote({
+    chatId,
+    telegramMessageId: incomingMessageId,
+    text: note,
+    score,
+    scoreReason: reason,
+  });
+
+  const sentMessageId = await sendTelegramMessage(chatId, draft);
+
+  await saveDraft({
+    noteId,
+    draftText: draft,
+    news: usedNews ? newsItem : null,
+    telegramMessageId: sentMessageId,
+  });
+}
 
 export default async function handler(req, res) {
   // Telegram only ever sends POST. Respond 200 to anything else (e.g. a
@@ -35,6 +101,8 @@ export default async function handler(req, res) {
     }
 
     const chatId = message.chat.id;
+    const messageId = message.message_id;
+    const replyToMessageId = message.reply_to_message?.message_id ?? null;
 
     const allowedChatId = process.env.ALLOWED_CHAT_ID;
     if (allowedChatId && String(chatId) !== String(allowedChatId)) {
@@ -42,30 +110,39 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (text.trim() === '/start') {
+    const trimmed = text.trim();
+
+    if (trimmed === '/start') {
       await sendTelegramMessage(
         chatId,
-        "Hi! Send me a note and I'll turn it into a draft post in your voice."
+        "Hi! Send me a note and I'll turn it into a draft post in your voice. Reply APPROVE or REJECT to a draft to record your decision."
       );
       res.status(200).send('ok');
       return;
     }
 
-    await sendTypingAction(chatId);
+    if (/^approve$/i.test(trimmed)) {
+      await handleApproval(chatId, replyToMessageId, 'approved');
+      res.status(200).send('ok');
+      return;
+    }
 
-    const draft = await generateDraft(text);
+    if (/^reject$/i.test(trimmed)) {
+      await handleApproval(chatId, replyToMessageId, 'rejected');
+      res.status(200).send('ok');
+      return;
+    }
 
-    await sendTelegramMessage(chatId, draft);
-
+    await handleNote(chatId, messageId, text);
     res.status(200).send('ok');
   } catch (err) {
     console.error('Webhook error:', err);
     try {
-      const chatId = req.body && req.body.message && req.body.message.chat && req.body.message.chat.id;
+      const chatId = req.body?.message?.chat?.id;
       if (chatId) {
         await sendTelegramMessage(
           chatId,
-          "Sorry, something went wrong generating that draft. Please try again."
+          'Sorry, something went wrong generating that draft. Please try again.'
         );
       }
     } catch (notifyErr) {

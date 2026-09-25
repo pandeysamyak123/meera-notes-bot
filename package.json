@@ -7,9 +7,13 @@
   "scripts": {
     "set-webhook": "node scripts/set-webhook.js",
     "get-webhook-info": "node scripts/get-webhook-info.js",
-    "delete-webhook": "node scripts/delete-webhook.js"
+    "delete-webhook": "node scripts/delete-webhook.js",
+    "compare-models": "node scripts/compare-models.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0"
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@google/generative-ai": "^0.21.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5"
   }
 }

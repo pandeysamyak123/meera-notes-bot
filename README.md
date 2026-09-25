@@ -1,8 +1,9 @@
 # Meera Notes Bot
 
-Meera texts a note to a Telegram bot. The bot sends the note to Gemini, along
-with instructions describing how she writes, and replies in the same chat
-with a drafted post.
+Meera texts a note to a Telegram bot. The pipeline scores it, optionally
+finds a relevant news angle, drafts a post in her voice via Gemini, and
+replies in the same chat. She can reply `APPROVE` or `REJECT` to record her
+decision. Everything is logged to Supabase.
 
 Runs as a Vercel serverless function that Telegram calls via a webhook
 (there's no long-running process to keep alive).
@@ -13,28 +14,87 @@ Runs as a Vercel serverless function that Telegram calls via a webhook
 Meera's Telegram message
         |
         v
-Telegram calls  ->  api/webhook.js  (Vercel serverless function)
+Telegram calls -> api/webhook.js  (Vercel serverless function)
                           |
                           v
-                 lib/gemini.js  (note + lib/voice-instructions.js -> Gemini)
+              lib/scoring.js  (Gemini scores 0-10; below 6 -> reject & stop)
                           |
                           v
-                 lib/telegram.js  ->  reply sent back to the same chat
+              lib/news.js  (Gemini picks search terms -> Google News RSS)
+                          |
+                          v
+              lib/gemini.js  (note + news + voice skill -> drafted post)
+                          |
+                          v
+              lib/telegram.js  ->  draft sent back to the same chat
+                          |
+                          v
+              lib/supabase.js  ->  note + draft saved (status: pending)
+
+Later: Meera replies APPROVE / REJECT
+        -> lib/supabase.js updates that draft's status
 ```
+
+The voice profile itself lives in the `meera_voice_skill` Supabase table
+(seeded from `voice-skill.txt`), so it can be updated without a redeploy -
+see "Updating Meera's voice" below.
 
 ## Files
 
-- `api/webhook.js` - the Telegram webhook endpoint. All the request handling
-  logic lives here.
-- `lib/gemini.js` - calls the Gemini API with the note + voice instructions.
-- `lib/telegram.js` - small helpers for sending messages back to Telegram.
-- `lib/voice-instructions.js` - **edit this** with a description of how Meera
-  writes (tone, structure, example posts, etc). This is what makes drafts
-  sound like her instead of a generic AI.
+- `api/webhook.js` - the Telegram webhook endpoint; orchestrates scoring ->
+  news -> drafting -> saving -> sending, and handles APPROVE/REJECT replies.
+- `lib/scoring.js` - asks Gemini to score a note 0-10 with a one-line reason;
+  notes scoring below 6 never reach drafting.
+- `lib/news.js` - asks Gemini for a short search phrase, then queries Google
+  News' public RSS search (no API key needed) for the top matching article.
+- `lib/gemini.js` - drafts the post from the note + voice profile + (if
+  relevant) the news item. If the news item is actually used, appends a
+  verify-flag block with the real headline/source/date/link - never a
+  paraphrased one, since those fields are inserted in code, not by the model.
+- `lib/gemini-client.js` - shared Gemini client/model setup used by scoring,
+  news, and drafting.
+- `lib/claude.js` - same drafting prompt, via Claude - used only by
+  `scripts/compare-models.js`, not part of the live bot.
+- `lib/telegram.js` - sends messages/typing indicator, returns the sent
+  message's `message_id` so replies can be matched back to a specific draft.
+- `lib/supabase.js` - reads the voice profile and persists notes/drafts.
+- `lib/voice.js` - local fallback voice profile (`voice-skill.txt`), used only
+  if Supabase is unreachable.
+- `voice-skill.txt` - the voice profile as originally seeded into Supabase.
+  Edit `meera_voice_skill.content` in Supabase to change it live (see below).
 - `scripts/set-webhook.js` - one-time script to point Telegram at your
   deployed URL.
 - `scripts/get-webhook-info.js` / `scripts/delete-webhook.js` - debugging
   helpers.
+- `scripts/compare-models.js` - runs one note through both Gemini and Claude
+  side by side, for comparing voice fidelity.
+
+## Database (Supabase)
+
+Three tables:
+
+- **`meera_notes`** - every note received, with its score and score reason.
+- **`meera_drafts`** - every draft produced, linked to its note, with
+  `status` (`pending` / `approved` / `rejected`) and the news fields if a
+  news item was used.
+- **`meera_voice_skill`** - single row (`id = 1`) holding the current voice
+  profile text.
+
+RLS is left disabled on these tables (default) - only the server holds the
+Supabase key, so nothing public can read or write them directly. If you'd
+rather enable RLS, add a policy that allows the service role and nothing
+else.
+
+### Updating Meera's voice
+
+Update the live copy directly:
+
+```sql
+update meera_voice_skill set content = '...' , updated_at = now() where id = 1;
+```
+
+Run that in the Supabase SQL editor. No redeploy needed - the next note
+picks up the new profile immediately.
 
 ## Setup
 
@@ -47,22 +107,72 @@ Telegram calls  ->  api/webhook.js  (Vercel serverless function)
 
 ### 2. Get a Gemini API key
 
-Create one at [Google AI Studio](https://aistudio.google.com/apikey).
+Create one at [Google AI Studio](https://aistudio.google.com/apikey). Check
+which models your key actually has access to:
 
-### 3. Fill in Meera's voice instructions
+```bash
+curl "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
+```
 
-Edit [`lib/voice-instructions.js`](lib/voice-instructions.js) and replace the
-placeholder with a real description of how Meera writes - tone, sentence
-rhythm, words she does/doesn't use, formatting habits, and ideally 2-3 real
-example posts pasted in full. The more concrete, the better the drafts.
+### 3. Create a Supabase project and the tables
 
-### 4. Install dependencies
+Create a project at [supabase.com](https://supabase.com), then run this in
+its SQL editor:
+
+```sql
+create table if not exists meera_notes (
+  id uuid primary key default gen_random_uuid(),
+  telegram_chat_id bigint not null,
+  telegram_message_id bigint,
+  text text not null,
+  score int,
+  score_reason text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists meera_drafts (
+  id uuid primary key default gen_random_uuid(),
+  note_id uuid references meera_notes(id) on delete cascade,
+  draft_text text not null,
+  news_headline text,
+  news_source text,
+  news_date text,
+  news_link text,
+  telegram_message_id bigint,
+  status text not null default 'pending' check (status in ('pending','approved','rejected')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists meera_voice_skill (
+  id int primary key default 1,
+  content text not null,
+  updated_at timestamptz not null default now(),
+  constraint meera_voice_skill_singleton check (id = 1)
+);
+```
+
+Then seed the voice profile (paste your real one in place of the text):
+
+```sql
+insert into meera_voice_skill (id, content) values (1, 'PASTE VOICE PROFILE HERE');
+```
+
+Grab `SUPABASE_URL` and the `anon` / publishable key from Project Settings ->
+API.
+
+### 4. Fill in Meera's voice instructions (local fallback)
+
+`voice-skill.txt` is only used if Supabase is unreachable - keep it in sync
+with what's in the `meera_voice_skill` table as a backup.
+
+### 5. Install dependencies
 
 ```bash
 npm install
 ```
 
-### 5. Deploy to Vercel
+### 6. Deploy to Vercel
 
 ```bash
 npx vercel
@@ -75,8 +185,15 @@ Environment Variables, or via the CLI):
 ```bash
 npx vercel env add TELEGRAM_BOT_TOKEN
 npx vercel env add GEMINI_API_KEY
+npx vercel env add SUPABASE_URL
+npx vercel env add SUPABASE_KEY
 npx vercel env add TELEGRAM_WEBHOOK_SECRET
 ```
+
+**Important**: new Vercel projects default to Vercel Authentication
+(deployment protection), which would block Telegram's webhook calls. Turn it
+off under Project Settings -> Deployment Protection, or via the API
+(`ssoProtection: null`).
 
 See `.env.example` for all available variables. Then deploy to production:
 
@@ -86,7 +203,7 @@ npx vercel --prod
 
 Note the production URL it gives you, e.g. `https://meera-notes-bot.vercel.app`.
 
-### 6. Point Telegram at your deployment
+### 7. Point Telegram at your deployment
 
 Run this once, locally, using the same token and secret you set in Vercel:
 
@@ -101,10 +218,12 @@ Confirm it worked:
 TELEGRAM_BOT_TOKEN=your-token npm run get-webhook-info
 ```
 
-### 7. Try it
+### 8. Try it
 
 Open Telegram, find your bot, send `/start`, then send a real note. You
-should get a drafted post back in the same chat within a few seconds.
+should get either a drafted post, or a short message saying why the note
+scored too low to draft. Reply `APPROVE` or `REJECT` to a draft (a plain
+reply to that message, or just typing the word) to record your decision.
 
 ## Securing the webhook
 
@@ -117,6 +236,17 @@ doing anything.
 For an extra layer, once you know Meera's Telegram chat ID (visible in the
 logs after her first message, or via `getWebhookInfo`/`getUpdates`), set
 `ALLOWED_CHAT_ID` so the bot only ever responds to her.
+
+## Comparing Gemini vs Claude
+
+```bash
+ANTHROPIC_API_KEY=your-key node scripts/compare-models.js "the note text"
+```
+
+Prints both drafts side by side. Useful for deciding whether to switch
+`lib/gemini.js`'s drafting call over to `lib/claude.js` - the scoring step
+stays on Gemini Flash either way (fast, cheap; doesn't need to hold a full
+voice across a post the way drafting does).
 
 ## Local testing
 
@@ -134,12 +264,13 @@ URL afterwards.
 ## Notes / things you may want to adjust
 
 - **Model**: defaults to `gemini-3.1-flash-lite` (fast, cheap, verified
-  working on this key). Change via the `GEMINI_MODEL` env var if you want a
-  different model - list what your key has access to with:
-  `curl "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"`
+  working on this key). Change via the `GEMINI_MODEL` env var.
+- **Score threshold**: hardcoded at 6 in `lib/scoring.js`
+  (`SCORE_PASS_THRESHOLD`). If everything passes, the scoring prompt is too
+  lenient - tighten the prompt or raise the threshold.
 - **Message length**: Telegram caps messages at 4096 characters;
   `lib/telegram.js` automatically splits longer drafts into multiple
   messages.
-- **Errors**: if Gemini or Telegram fails, the bot tells Meera something
-  went wrong instead of leaving her waiting. Check Vercel's function logs
+- **Errors**: if any step fails, the bot tells Meera something went wrong
+  instead of leaving her waiting. Check Vercel's function logs
   (`npx vercel logs`) for details.
