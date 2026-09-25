@@ -1,0 +1,15 @@
+{
+  "name": "meera-notes-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram bot that turns Meera's raw text notes into drafted posts using Gemini, in her own voice.",
+  "scripts": {
+    "set-webhook": "node scripts/set-webhook.js",
+    "get-webhook-info": "node scripts/get-webhook-info.js",
+    "delete-webhook": "node scripts/delete-webhook.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0"
+  }
+}
