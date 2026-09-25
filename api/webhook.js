@@ -7,11 +7,38 @@ import {
   saveDraft,
   findPendingDraft,
   updateDraftStatus,
+  markDraftPosted,
 } from '../lib/supabase.js';
+import {
+  postToLinkedIn,
+  LinkedInNotConnectedError,
+  LinkedInTokenExpiredError,
+} from '../lib/linkedin.js';
 
-async function handleApproval(chatId, replyToMessageId, decision) {
+function connectUrl() {
+  const base = process.env.APP_BASE_URL || '';
+  return `${base}/api/linkedin/connect`;
+}
+
+async function handleReject(chatId, replyToMessageId) {
   const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
+  if (!draft) {
+    await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
+    return;
+  }
+  if (draft.status !== 'pending') {
+    await sendTelegramMessage(chatId, `That draft was already marked ${draft.status}.`);
+    return;
+  }
+  await updateDraftStatus(draft.id, 'rejected');
+  await sendTelegramMessage(chatId, 'Marked as rejected - noted for later.');
+}
 
+// APPROVE both records the decision and publishes the draft to LinkedIn in
+// one step. If publishing fails, the draft is left pending so she can just
+// reply APPROVE again once LinkedIn is (re)connected.
+async function handleApprove(chatId, replyToMessageId) {
+  const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
   if (!draft) {
     await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
     return;
@@ -21,11 +48,30 @@ async function handleApproval(chatId, replyToMessageId, decision) {
     return;
   }
 
-  await updateDraftStatus(draft.id, decision);
-  await sendTelegramMessage(
-    chatId,
-    decision === 'approved' ? 'Marked as approved.' : 'Marked as rejected - noted for later.'
-  );
+  await sendTypingAction(chatId);
+
+  try {
+    const { postUrn } = await postToLinkedIn(draft.draft_text);
+    await markDraftPosted(draft.id, postUrn || null);
+    await sendTelegramMessage(chatId, '✅ Posted to LinkedIn.');
+  } catch (err) {
+    if (err instanceof LinkedInNotConnectedError) {
+      await sendTelegramMessage(
+        chatId,
+        `LinkedIn isn't connected yet. Open this link, log in, and approve access, then reply APPROVE again:\n${connectUrl()}`
+      );
+      return;
+    }
+    if (err instanceof LinkedInTokenExpiredError) {
+      await sendTelegramMessage(
+        chatId,
+        `Your LinkedIn connection expired. Reconnect here, then reply APPROVE again:\n${connectUrl()}`
+      );
+      return;
+    }
+    console.error('LinkedIn post failed:', err);
+    await sendTelegramMessage(chatId, "Couldn't post to LinkedIn (something went wrong on LinkedIn's end). The draft is still pending - try APPROVE again in a bit.");
+  }
 }
 
 async function handleNote(chatId, incomingMessageId, note) {
@@ -115,20 +161,20 @@ export default async function handler(req, res) {
     if (trimmed === '/start') {
       await sendTelegramMessage(
         chatId,
-        "Hi! Send me a note and I'll turn it into a draft post in your voice. Reply APPROVE or REJECT to a draft to record your decision."
+        "Hi! Send me a note and I'll turn it into a draft post in your voice. Reply APPROVE to a draft to post it to LinkedIn, or REJECT to discard it."
       );
       res.status(200).send('ok');
       return;
     }
 
     if (/^approve$/i.test(trimmed)) {
-      await handleApproval(chatId, replyToMessageId, 'approved');
+      await handleApprove(chatId, replyToMessageId);
       res.status(200).send('ok');
       return;
     }
 
     if (/^reject$/i.test(trimmed)) {
-      await handleApproval(chatId, replyToMessageId, 'rejected');
+      await handleReject(chatId, replyToMessageId);
       res.status(200).send('ok');
       return;
     }

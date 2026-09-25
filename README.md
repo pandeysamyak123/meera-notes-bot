@@ -58,6 +58,13 @@ see "Updating Meera's voice" below.
 - `lib/telegram.js` - sends messages/typing indicator, returns the sent
   message's `message_id` so replies can be matched back to a specific draft.
 - `lib/supabase.js` - reads the voice profile and persists notes/drafts.
+- `lib/linkedin.js` - LinkedIn OAuth (authorize URL, token exchange) and
+  posting to Meera's personal feed. Tokens are stored in the
+  `meera_linkedin_auth` Supabase table.
+- `api/linkedin/connect.js` - visit this URL to (re)authorize the bot to post
+  as Meera.
+- `api/linkedin/callback.js` - LinkedIn's OAuth redirect target; exchanges
+  the code for a token and saves it.
 - `lib/voice.js` - local fallback voice profile (`voice-skill.txt`), used only
   if Supabase is unreachable.
 - `voice-skill.txt` - the voice profile as originally seeded into Supabase.
@@ -79,6 +86,10 @@ Three tables:
   news item was used.
 - **`meera_voice_skill`** - single row (`id = 1`) holding the current voice
   profile text.
+- **`meera_linkedin_auth`** - single row (`id = 1`) holding the current
+  LinkedIn access token, refresh token (if any), and expiry.
+- **`meera_oauth_state`** - short-lived CSRF state values for the LinkedIn
+  OAuth handshake; rows are deleted as soon as they're used.
 
 RLS is left disabled on these tables (default) - only the server holds the
 Supabase key, so nothing public can read or write them directly. If you'd
@@ -149,6 +160,22 @@ create table if not exists meera_voice_skill (
   content text not null,
   updated_at timestamptz not null default now(),
   constraint meera_voice_skill_singleton check (id = 1)
+);
+
+create table if not exists meera_linkedin_auth (
+  id int primary key default 1,
+  person_urn text not null,
+  access_token text not null,
+  refresh_token text,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint meera_linkedin_auth_singleton check (id = 1)
+);
+
+create table if not exists meera_oauth_state (
+  state text primary key,
+  created_at timestamptz not null default now()
 );
 ```
 
@@ -236,6 +263,49 @@ doing anything.
 For an extra layer, once you know Meera's Telegram chat ID (visible in the
 logs after her first message, or via `getWebhookInfo`/`getUpdates`), set
 `ALLOWED_CHAT_ID` so the bot only ever responds to her.
+
+## Connect LinkedIn
+
+Replying `APPROVE` to a draft posts it directly to Meera's personal LinkedIn
+feed. That needs a one-time OAuth connection:
+
+### 1. Create a LinkedIn Developer App
+
+1. Go to [linkedin.com/developers/apps](https://www.linkedin.com/developers/apps)
+   and create an app (needs an associated LinkedIn Company Page - a personal
+   "test" page is fine if you don't have one).
+2. Under the app's **Products** tab, request/add:
+   - **Sign In with LinkedIn using OpenID Connect** (instant, self-serve)
+   - **Share on LinkedIn** (instant, self-serve)
+3. Under **Auth**, add this exact redirect URL (replace with your real
+   deployed URL):
+   `https://meera-notes-bot.vercel.app/api/linkedin/callback`
+4. Copy the **Client ID** and **Client Secret** from the Auth tab.
+
+### 2. Set environment variables
+
+```bash
+npx vercel env add LINKEDIN_CLIENT_ID
+npx vercel env add LINKEDIN_CLIENT_SECRET
+npx vercel env add APP_BASE_URL   # e.g. https://meera-notes-bot.vercel.app
+```
+
+Redeploy so these take effect.
+
+### 3. Authorize as Meera
+
+Open `https://your-deployed-url/api/linkedin/connect` in a browser **while
+logged into Meera's LinkedIn account**, and approve access. You'll land on a
+plain "LinkedIn connected" page when it works.
+
+LinkedIn access tokens last about 60 days. When one expires, `APPROVE` will
+reply with a fresh link to this same `/api/linkedin/connect` URL - just
+repeat this step and then reply `APPROVE` again.
+
+**Note**: this posts to Meera's *personal* profile. Posting to a LinkedIn
+Company Page instead requires LinkedIn's Community Management API, which
+needs their Marketing Partner review/approval - a materially bigger lift, not
+covered here.
 
 ## Comparing Gemini vs Claude
 
