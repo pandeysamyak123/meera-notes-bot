@@ -1,10 +1,18 @@
 import { generateDraft } from '../lib/gemini.js';
 import { scoreNote, passesScore } from '../lib/scoring.js';
 import { extractSearchQuery, fetchTopNews } from '../lib/news.js';
-import { sendTelegramMessage, sendTypingAction } from '../lib/telegram.js';
+import {
+  sendTelegramMessage,
+  sendDraftMessage,
+  sendTypingAction,
+  answerCallbackQuery,
+  clearMessageButtons,
+} from '../lib/telegram.js';
 import {
   saveNote,
   saveDraft,
+  setDraftTelegramMessageId,
+  getDraftById,
   findPendingDraft,
   updateDraftStatus,
   markDraftPosted,
@@ -20,58 +28,99 @@ function connectUrl() {
   return `${base}/api/linkedin/connect`;
 }
 
-async function handleReject(chatId, replyToMessageId) {
-  const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
-  if (!draft) {
-    await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
-    return;
-  }
+// Shared by both the button-click and the type-the-word-REJECT paths.
+// Returns a short result the caller renders as either a chat message or a
+// callback-query toast.
+async function rejectDraft(draft) {
   if (draft.status !== 'pending') {
-    await sendTelegramMessage(chatId, `That draft was already marked ${draft.status}.`);
-    return;
+    return { ok: false, text: `Already marked ${draft.status}.` };
   }
   await updateDraftStatus(draft.id, 'rejected');
-  await sendTelegramMessage(chatId, 'Marked as rejected - noted for later.');
+  return { ok: true, text: 'Marked as rejected - noted for later.' };
 }
 
-// APPROVE both records the decision and publishes the draft to LinkedIn in
-// one step. If publishing fails, the draft is left pending so she can just
-// reply APPROVE again once LinkedIn is (re)connected.
-async function handleApprove(chatId, replyToMessageId) {
-  const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
-  if (!draft) {
-    await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
-    return;
-  }
+// Shared by both the button-click and the type-the-word-APPROVE paths.
+// Posts to LinkedIn and, on success, marks the draft approved+posted.
+async function approveDraft(draft) {
   if (draft.status !== 'pending') {
-    await sendTelegramMessage(chatId, `That draft was already marked ${draft.status}.`);
-    return;
+    return { ok: false, text: `Already marked ${draft.status}.` };
   }
-
-  await sendTypingAction(chatId);
 
   try {
     const { postUrn } = await postToLinkedIn(draft.draft_text);
     await markDraftPosted(draft.id, postUrn || null);
-    await sendTelegramMessage(chatId, '✅ Posted to LinkedIn.');
+    return { ok: true, text: '✅ Posted to LinkedIn.' };
   } catch (err) {
     if (err instanceof LinkedInNotConnectedError) {
-      await sendTelegramMessage(
-        chatId,
-        `LinkedIn isn't connected yet. Open this link, log in, and approve access, then reply APPROVE again:\n${connectUrl()}`
-      );
-      return;
+      return {
+        ok: false,
+        text: `LinkedIn isn't connected yet. Open this link, log in, and approve access, then try again:\n${connectUrl()}`,
+      };
     }
     if (err instanceof LinkedInTokenExpiredError) {
-      await sendTelegramMessage(
-        chatId,
-        `Your LinkedIn connection expired. Reconnect here, then reply APPROVE again:\n${connectUrl()}`
-      );
-      return;
+      return {
+        ok: false,
+        text: `Your LinkedIn connection expired. Reconnect here, then try again:\n${connectUrl()}`,
+      };
     }
     console.error('LinkedIn post failed:', err);
-    await sendTelegramMessage(chatId, "Couldn't post to LinkedIn (something went wrong on LinkedIn's end). The draft is still pending - try APPROVE again in a bit.");
+    return {
+      ok: false,
+      text: "Couldn't post to LinkedIn (something went wrong on LinkedIn's end). The draft is still pending - try again in a bit.",
+    };
   }
+}
+
+async function handleCallbackQuery(callbackQuery) {
+  const [action, draftId] = (callbackQuery.data || '').split(':');
+  const chatId = callbackQuery.message?.chat?.id;
+  const messageId = callbackQuery.message?.message_id;
+
+  const draft = draftId ? await getDraftById(draftId) : null;
+
+  if (!draft) {
+    await answerCallbackQuery(callbackQuery.id, 'Draft not found.');
+    return;
+  }
+
+  if (action !== 'approve' && action !== 'reject') {
+    await answerCallbackQuery(callbackQuery.id, 'Unknown action.');
+    return;
+  }
+
+  if (draft.status !== 'pending') {
+    await answerCallbackQuery(callbackQuery.id, `Already marked ${draft.status}.`);
+    if (chatId && messageId) await clearMessageButtons(chatId, messageId);
+    return;
+  }
+
+  if (action === 'reject') {
+    const result = await rejectDraft(draft);
+    await answerCallbackQuery(callbackQuery.id, result.text);
+    if (chatId && messageId) await clearMessageButtons(chatId, messageId);
+    return;
+  }
+
+  // Approve can take a few seconds (LinkedIn API call) - acknowledge the tap
+  // immediately so the button stops spinning, full result follows as a
+  // regular message.
+  await answerCallbackQuery(callbackQuery.id, 'Posting to LinkedIn...');
+  const result = await approveDraft(draft);
+  if (chatId) {
+    await sendTelegramMessage(chatId, result.text);
+    if (result.ok && messageId) await clearMessageButtons(chatId, messageId);
+  }
+}
+
+async function handleTextDecision(chatId, replyToMessageId, action) {
+  const draft = await findPendingDraft({ chatId, replyToTelegramMessageId: replyToMessageId });
+  if (!draft) {
+    await sendTelegramMessage(chatId, "I don't have a pending draft to update. Send a note first.");
+    return;
+  }
+
+  const result = action === 'approve' ? await approveDraft(draft) : await rejectDraft(draft);
+  await sendTelegramMessage(chatId, result.text);
 }
 
 async function handleNote(chatId, incomingMessageId, note) {
@@ -103,14 +152,19 @@ async function handleNote(chatId, incomingMessageId, note) {
     scoreReason: reason,
   });
 
-  const sentMessageId = await sendTelegramMessage(chatId, draft);
-
-  await saveDraft({
+  // Saved before sending so the draft's id can be embedded in the
+  // Approve/Reject buttons' callback_data.
+  const draftId = await saveDraft({
     noteId,
     draftText: draft,
     news: usedNews ? newsItem : null,
-    telegramMessageId: sentMessageId,
+    telegramMessageId: null,
   });
+
+  const sentMessageId = await sendDraftMessage(chatId, draft, draftId);
+  if (sentMessageId) {
+    await setDraftTelegramMessageId(draftId, sentMessageId);
+  }
 }
 
 export default async function handler(req, res) {
@@ -138,6 +192,17 @@ export default async function handler(req, res) {
   // duplicate messages rather than any recovery.
   try {
     const update = req.body;
+
+    if (update?.callback_query) {
+      const chatId = update.callback_query.message?.chat?.id;
+      const allowedChatId = process.env.ALLOWED_CHAT_ID;
+      if (!allowedChatId || String(chatId) === String(allowedChatId)) {
+        await handleCallbackQuery(update.callback_query);
+      }
+      res.status(200).send('ok');
+      return;
+    }
+
     const message = update && update.message;
     const text = message && message.text;
 
@@ -161,20 +226,20 @@ export default async function handler(req, res) {
     if (trimmed === '/start') {
       await sendTelegramMessage(
         chatId,
-        "Hi! Send me a note and I'll turn it into a draft post in your voice. Reply APPROVE to a draft to post it to LinkedIn, or REJECT to discard it."
+        "Hi! Send me a note and I'll turn it into a draft post in your voice. Tap the button on a draft to post it to LinkedIn or reject it."
       );
       res.status(200).send('ok');
       return;
     }
 
     if (/^approve$/i.test(trimmed)) {
-      await handleApprove(chatId, replyToMessageId);
+      await handleTextDecision(chatId, replyToMessageId, 'approve');
       res.status(200).send('ok');
       return;
     }
 
     if (/^reject$/i.test(trimmed)) {
-      await handleReject(chatId, replyToMessageId);
+      await handleTextDecision(chatId, replyToMessageId, 'reject');
       res.status(200).send('ok');
       return;
     }
@@ -184,11 +249,11 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('Webhook error:', err);
     try {
-      const chatId = req.body?.message?.chat?.id;
+      const chatId = req.body?.message?.chat?.id || req.body?.callback_query?.message?.chat?.id;
       if (chatId) {
         await sendTelegramMessage(
           chatId,
-          'Sorry, something went wrong generating that draft. Please try again.'
+          'Sorry, something went wrong. Please try again.'
         );
       }
     } catch (notifyErr) {

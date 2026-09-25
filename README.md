@@ -2,8 +2,9 @@
 
 Meera texts a note to a Telegram bot. The pipeline scores it, optionally
 finds a relevant news angle, drafts a post in her voice via Gemini, and
-replies in the same chat. She can reply `APPROVE` or `REJECT` to record her
-decision. Everything is logged to Supabase.
+replies in the same chat with **Post to LinkedIn** / **Reject** buttons.
+Tapping the first one publishes it live to her LinkedIn feed. Everything is
+logged to Supabase.
 
 Runs as a Vercel serverless function that Telegram calls via a webhook
 (there's no long-running process to keep alive).
@@ -248,9 +249,11 @@ TELEGRAM_BOT_TOKEN=your-token npm run get-webhook-info
 ### 8. Try it
 
 Open Telegram, find your bot, send `/start`, then send a real note. You
-should get either a drafted post, or a short message saying why the note
-scored too low to draft. Reply `APPROVE` or `REJECT` to a draft (a plain
-reply to that message, or just typing the word) to record your decision.
+should get either a drafted post with **Post to LinkedIn** / **Reject**
+buttons, or a short message saying why the note scored too low to draft.
+Tapping **Post to LinkedIn** publishes it live and marks it approved;
+**Reject** just discards it. (Typing `APPROVE` / `REJECT` as a plain reply to
+the draft message still works too, as a fallback.)
 
 ## Securing the webhook
 
@@ -266,8 +269,8 @@ logs after her first message, or via `getWebhookInfo`/`getUpdates`), set
 
 ## Connect LinkedIn
 
-Replying `APPROVE` to a draft posts it directly to Meera's personal LinkedIn
-feed. That needs a one-time OAuth connection:
+Tapping **Post to LinkedIn** on a draft posts it directly to Meera's personal
+LinkedIn feed. That needs a one-time OAuth connection:
 
 ### 1. Create a LinkedIn Developer App
 
@@ -298,9 +301,10 @@ Open `https://your-deployed-url/api/linkedin/connect` in a browser **while
 logged into Meera's LinkedIn account**, and approve access. You'll land on a
 plain "LinkedIn connected" page when it works.
 
-LinkedIn access tokens last about 60 days. When one expires, `APPROVE` will
-reply with a fresh link to this same `/api/linkedin/connect` URL - just
-repeat this step and then reply `APPROVE` again.
+LinkedIn access tokens last about 60 days. When one expires, tapping **Post
+to LinkedIn** will reply with a fresh link to this same
+`/api/linkedin/connect` URL - just repeat this step and tap the button again
+(the draft stays pending until it succeeds).
 
 **Note**: this posts to Meera's *personal* profile. Posting to a LinkedIn
 Company Page instead requires LinkedIn's Community Management API, which
