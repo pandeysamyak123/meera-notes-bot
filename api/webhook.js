@@ -253,7 +253,7 @@ export default async function handler(req, res) {
       if (chatId) {
         await sendTelegramMessage(
           chatId,
-          'Sorry, something went wrong. Please try again.'
+          "Sorry, something went wrong (likely Gemini being briefly overloaded). Please send that again in a moment."
         );
       }
     } catch (notifyErr) {
